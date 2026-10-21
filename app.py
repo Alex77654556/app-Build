@@ -4,13 +4,13 @@ import shutil
 import subprocess
 import threading
 import uuid
+import requests
 from pathlib import Path
 from flask import Flask, request, render_template_string, send_file, jsonify
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me")
 
-# Task tracker
 tasks = {}
 
 def sanitize_package(url):
@@ -18,7 +18,7 @@ def sanitize_package(url):
     domain = re.sub(r'[^a-zA-Z0-9]', '', domain) or "myapp"
     return f"com.webview.{domain.lower()}"
 
-def create_webview_project(url, app_name, out_dir):
+def create_webview_project(url, app_name, icon_url, out_dir):
     pkg = sanitize_package(url)
     pkg_path = pkg.replace('.', '/')
     p = Path(out_dir)
@@ -26,15 +26,35 @@ def create_webview_project(url, app_name, out_dir):
 
     (p / "app/src/main/java" / pkg_path).mkdir(parents=True)
     (p / "app/src/main/res/values").mkdir(parents=True)
+    (p / "app/src/main/res/drawable").mkdir(parents=True)
 
+    # Logo Download Logic
+    icon_reference = "@android:drawable/sym_def_app_icon"
+    if icon_url:
+        try:
+            response = requests.get(icon_url, stream=True)
+            if response.status_code == 200:
+                with open(p / "app/src/main/res/drawable/app_logo.png", 'wb') as f:
+                    for chunk in response.iter_content(1024):
+                        f.write(chunk)
+                icon_reference = "@drawable/app_logo"
+        except Exception as e:
+            print(f"Logo download failed: {e}")
+
+    # MainActivity.java with PDF & New Tab handling
     (p / "app/src/main/java" / pkg_path / "MainActivity.java").write_text(f'''package {pkg};
 import android.os.Bundle;
+import android.os.Message;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import androidx.appcompat.app.AppCompatActivity;
+
 public class MainActivity extends AppCompatActivity {{
     private WebView webView;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {{
         super.onCreate(savedInstanceState);
@@ -42,10 +62,47 @@ public class MainActivity extends AppCompatActivity {{
         WebSettings s = webView.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
-        webView.setWebViewClient(new WebViewClient());
+        s.setLoadWithOverviewMode(true);
+        s.setUseWideViewPort(true);
+        
+        webView.setWebViewClient(new WebViewClient() {{
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {{
+                String url = request.getUrl().toString();
+                if (url.endsWith(".pdf") || url.contains(".pdf?")) {{
+                    view.loadUrl("https://docs.google.com/gview?embedded=true&url=" + url);
+                    return true;
+                }}
+                return false;
+            }}
+        }});
+
+        webView.setWebChromeClient(new WebChromeClient() {{
+            @Override
+            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {{
+                WebView newWebView = new WebView(view.getContext());
+                newWebView.setWebViewClient(new WebViewClient() {{
+                    @Override
+                    public boolean shouldOverrideUrlLoading(WebView view, String url) {{
+                        if (url.endsWith(".pdf") || url.contains(".pdf?")) {{
+                            view.loadUrl("https://docs.google.com/gview?embedded=true&url=" + url);
+                        }} else {{
+                            view.loadUrl(url);
+                        }}
+                        return true;
+                    }}
+                }});
+                WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+                transport.setWebView(newWebView);
+                resultMsg.sendToTarget();
+                return true;
+            }}
+        }});
+
         webView.loadUrl(getString(R.string.app_url));
         setContentView(webView);
     }}
+
     @Override
     public void onBackPressed() {{
         if (webView.canGoBack()) webView.goBack();
@@ -63,7 +120,7 @@ public class MainActivity extends AppCompatActivity {{
     (p / "app/src/main/AndroidManifest.xml").write_text(f'''<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{pkg}">
     <uses-permission android:name="android.permission.INTERNET"/>
-    <application android:allowBackup="true" android:icon="@android:drawable/sym_def_app_icon"
+    <application android:allowBackup="true" android:icon="{icon_reference}"
         android:label="@string/app_name" android:usesCleartextTraffic="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true">
@@ -90,12 +147,12 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 rootProject.name = "WebViewApp"
 include ':app'
 ''')
-    (p / "gradle.properties").write_text("org.gradle.jvmargs=-Xmx1024m\nandroid.useAndroidX=true\n")
+    (p / "gradle.properties").write_text("org.gradle.jvmargs=-Xmx2048m\nandroid.useAndroidX=true\n")
 
-def build_apk_thread(task_id, url, app_name):
+def build_apk_thread(task_id, url, app_name, icon_url):
     try:
         project_dir = f"/tmp/webview_{task_id}"
-        create_webview_project(url, app_name, project_dir)
+        create_webview_project(url, app_name, icon_url, project_dir)
         
         env = os.environ.copy()
         result = subprocess.run(
@@ -118,7 +175,6 @@ def build_apk_thread(task_id, url, app_name):
     except Exception as e:
         tasks[task_id] = {"status": "error", "message": str(e)}
 
-# ---------- APPILIX STYLE UI ----------
 HTML_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -126,96 +182,24 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>Dashboard - App Builder</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
     <style>
-        body {
-            margin: 0;
-            font-family: 'Inter', sans-serif;
-            background-color: #F4F5F1;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-        }
-        .container {
-            background: #ffffff;
-            padding: 40px;
-            border-radius: 16px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.05);
-            width: 100%;
-            max-width: 400px;
-            text-align: center;
-        }
-        .logo-svg {
-            width: 70px;
-            margin-bottom: 20px;
-        }
-        .spinner {
-            width: 70px;
-            animation: _il_spin 1.5s ease-in-out infinite;
-            display: none;
-            margin: 0 auto;
-        }
-        @keyframes _il_spin {
-            from { transform: rotate(0deg); }
-            to   { transform: rotate(360deg); }
-        }
+        body { margin: 0; font-family: 'Inter', sans-serif; background-color: #F4F5F1; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .container { background: #ffffff; padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.05); width: 100%; max-width: 400px; text-align: center; }
+        .logo-svg { width: 70px; margin-bottom: 20px; }
+        .spinner { width: 70px; animation: _il_spin 1.5s ease-in-out infinite; display: none; margin: 0 auto; }
+        @keyframes _il_spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         h2 { margin-top: 0; color: #1E8A7A; }
         p { color: #666; font-size: 14px; }
-        input {
-            width: 100%;
-            padding: 12px;
-            margin: 10px 0;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            box-sizing: border-box;
-            font-family: 'Inter', sans-serif;
-            background: #FAFAFA;
-        }
-        button {
-            width: 100%;
-            padding: 14px;
-            background: #1E8A7A;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            margin-top: 10px;
-            transition: background 0.3s;
-        }
+        input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; font-family: 'Inter', sans-serif; background: #FAFAFA; }
+        button { width: 100%; padding: 14px; background: #1E8A7A; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 10px; transition: background 0.3s; }
         button:hover { background: #3CB989; }
-        button:disabled { background: #ccc; cursor: not-allowed; }
-        .hidden { display: none; }
-        #error-msg {
-            color: #e74c3c;
-            background: #fadbd8;
-            padding: 10px;
-            border-radius: 8px;
-            margin-top: 15px;
-            font-size: 14px;
-            word-break: break-all;
-            display: none;
-        }
-        .download-btn {
-            background: #3CB989;
-            text-decoration: none;
-            display: block;
-            padding: 14px;
-            color: white;
-            border-radius: 8px;
-            font-weight: 600;
-            margin-top: 20px;
-        }
+        #error-msg { color: #e74c3c; background: #fadbd8; padding: 10px; border-radius: 8px; margin-top: 15px; font-size: 12px; word-break: break-all; display: none; text-align: left;}
+        .download-btn { background: #3CB989; text-decoration: none; display: block; padding: 14px; color: white; border-radius: 8px; font-weight: 600; margin-top: 20px; }
     </style>
 </head>
 <body>
-
-<div class="container" id="main-box">
-    <!-- Exact Appilix SVG Logo -->
+<div class="container">
     <svg id="app-logo" class="logo-svg" viewBox="0 0 32 28" fill="none" xmlns="http://www.w3.org/2000/svg">
         <path d="M5.125 4.44067H10.5641L16.0033 13.8681H11.0091L5.125 4.44067Z" fill="#5ED9A6"/>
         <path d="M10.5645 4.44279L13.2882 -0.267822L18.5038 9.53837L16.0036 13.8661L10.5645 4.44072V4.44279Z" fill="#3CB989"/>
@@ -226,23 +210,7 @@ HTML_TEMPLATE = """
         <path d="M16.0007 13.866L10.5574 23.2851H5.11621L11.0065 13.866H16.0007Z" fill="#3CB989"/>
         <path d="M10.5576 23.2873L13.2751 28L18.499 18.1959L16.0009 13.8682L10.5576 23.2873Z" fill="#1E8A7A"/>
         <path d="M5.11621 23.2852L7.23764 26.963C7.60812 27.6025 8.29112 27.9978 9.02999 27.9978H13.277L10.5595 23.2872H5.11828L5.11621 23.2852Z" fill="#5ED9A6"/>
-        <path d="M24.0024 0.00951618L18.5011 9.53837L15.8975 4.63113L18.7247 -0.267822H22.9717C23.3401 -0.265753 23.6919 -0.166408 24.0024 0.00951618Z" fill="url(#paint0_linear_3012_4516)"/>
-        <path d="M26.8821 4.44073L24.0529 9.35417L18.502 9.53838L24.0032 0.00952148C24.3136 0.187515 24.5786 0.446226 24.7628 0.769098L26.8821 4.44073Z" fill="url(#paint1_linear_3012_4516)"/>
-        <path d="M26.878 23.2874L24.709 27.0438C24.5289 27.3274 24.2847 27.5592 24.0011 27.7227L18.7255 18.5767L18.502 18.1938L24.0549 18.3884L26.8801 23.2874H26.878Z" fill="url(#paint2_linear_3012_4516)"/>
-        <path d="M18.4996 18.1937L15.8877 23.0947L18.7128 27.9937H23.1026H23.1068C23.4255 27.9709 23.7277 27.8757 23.9967 27.7205L18.4976 18.1917L18.4996 18.1937Z" fill="url(#paint3_linear_3012_4516)"/>
-        <path d="M8.06765 9.15552H2.3967L0.256642 12.8644C0.0848573 13.1769 0 13.5226 0 13.8682H11.0066L8.06558 9.15552H8.06765Z" fill="url(#paint4_linear_3012_4516)"/>
-        <path d="M0 13.8682C0.00206969 14.2221 0.0952058 14.576 0.277339 14.8947L2.39877 18.5726L8.06558 18.5788L11.0066 13.8682H0Z" fill="url(#paint5_linear_3012_4516)"/>
-        <defs>
-            <linearGradient id="paint0_linear_3012_4516" x1="11.7767" y1="21.1824" x2="20.6991" y2="0.58903" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#1E8A7A"/></linearGradient>
-            <linearGradient id="paint1_linear_3012_4516" x1="8.82201" y1="27.5881" x2="24.2578" y2="4.33517" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#3CB989"/></linearGradient>
-            <linearGradient id="paint2_linear_3012_4516" x1="14.5364" y1="11.8792" x2="26.6607" y2="26.1601" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#1E8A7A"/></linearGradient>
-            <linearGradient id="paint3_linear_3012_4516" x1="5.34469" y1="1.09187" x2="19.8367" y2="25.1334" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#3CB989"/></linearGradient>
-            <linearGradient id="paint4_linear_3012_4516" x1="28.8184" y1="11.4135" x2="3.52882" y2="11.5274" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#1E8A7A"/></linearGradient>
-            <linearGradient id="paint5_linear_3012_4516" x1="34.9219" y1="17.1735" x2="4.02348" y2="16.1303" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#3CB989"/></linearGradient>
-        </defs>
     </svg>
-
-    <!-- Appilix Style Spinner -->
     <svg id="spinner" class="spinner" viewBox="0 0 32 28" fill="none" xmlns="http://www.w3.org/2000/svg">
         <path d="M5.125 4.44067H10.5641L16.0033 13.8681H11.0091L5.125 4.44067Z" fill="#5ED9A6"/>
         <path d="M10.5645 4.44279L13.2882 -0.267822L18.5038 9.53837L16.0036 13.8661L10.5645 4.44072V4.44279Z" fill="#3CB989"/>
@@ -259,8 +227,9 @@ HTML_TEMPLATE = """
     <p id="subtitle">Convert any URL into an Android App</p>
 
     <form id="build-form">
-        <input type="url" id="url" placeholder="https://example.com" required>
-        <input type="text" id="app_name" placeholder="App Name (Optional)">
+        <input type="url" id="url" placeholder="Website URL (https://...)" required>
+        <input type="text" id="app_name" placeholder="App Name (e.g. Testbook)">
+        <input type="url" id="icon_url" placeholder="Logo URL (Optional .png)">
         <button type="submit" id="build-btn">Build App</button>
     </form>
 
@@ -279,30 +248,29 @@ HTML_TEMPLATE = """
 
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
-        
-        // UI changes
         form.style.display = 'none';
         errorMsg.style.display = 'none';
         logo.style.display = 'none';
         spinner.style.display = 'block';
         title.innerText = "Building APK...";
-        subtitle.innerText = "This may take 2-3 minutes. Please wait.";
+        subtitle.innerText = "Please wait 2-4 minutes. Do not close.";
 
         const url = document.getElementById('url').value;
         const app_name = document.getElementById('app_name').value || "MyApp";
+        const icon_url = document.getElementById('icon_url').value || "";
 
         try {
             const response = await fetch('/api/build', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({url: url, app_name: app_name})
+                body: JSON.stringify({url: url, app_name: app_name, icon_url: icon_url})
             });
             const data = await response.json();
             
             if (data.task_id) {
                 checkStatus(data.task_id);
             } else {
-                showError(data.error || "Failed to start build.");
+                showError(data.error || "Failed to start.");
             }
         } catch (err) {
             showError("Server connection failed.");
@@ -315,22 +283,18 @@ HTML_TEMPLATE = """
             const data = await res.json();
 
             if (data.status === 'building') {
-                setTimeout(() => checkStatus(taskId), 5000); // Check every 5 seconds
+                setTimeout(() => checkStatus(taskId), 5000); 
             } else if (data.status === 'success') {
-                showSuccess(taskId);
+                spinner.style.display = 'none';
+                title.innerText = "App Ready!";
+                subtitle.innerText = "Your APK has been generated.";
+                successArea.innerHTML = `<a href="/download/${taskId}" class="download-btn">Download APK</a>`;
             } else {
-                showError(data.message || "Build failed. Check server logs.");
+                showError(data.message || "Build failed. Check logs.");
             }
         } catch (err) {
             showError("Error checking status.");
         }
-    }
-
-    function showSuccess(taskId) {
-        spinner.style.display = 'none';
-        title.innerText = "App Ready!";
-        subtitle.innerText = "Your APK has been successfully generated.";
-        successArea.innerHTML = `<a href="/download/${taskId}" class="download-btn">Download APK</a>`;
     }
 
     function showError(msg) {
@@ -356,6 +320,7 @@ def api_build():
     data = request.json
     url = data.get("url", "").strip()
     app_name = data.get("app_name", "").strip() or "MyApp"
+    icon_url = data.get("icon_url", "").strip()
 
     if not url.startswith(("http://", "https://")):
         return jsonify({"error": "URL must start with http:// or https://"})
@@ -363,7 +328,7 @@ def api_build():
     task_id = str(uuid.uuid4())[:8]
     tasks[task_id] = {"status": "building"}
     
-    thread = threading.Thread(target=build_apk_thread, args=(task_id, url, app_name))
+    thread = threading.Thread(target=build_apk_thread, args=(task_id, url, app_name, icon_url))
     thread.start()
     
     return jsonify({"task_id": task_id})
