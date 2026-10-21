@@ -2,13 +2,17 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import uuid
 from pathlib import Path
-from flask import Flask, request, render_template_string, send_file, flash, redirect, url_for
+from flask import Flask, request, render_template_string, send_file, jsonify
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me")
 
-# ---------- Helper Functions ----------
+# Task tracker
+tasks = {}
+
 def sanitize_package(url):
     domain = re.sub(r'^https?://', '', url).split('/')[0]
     domain = re.sub(r'[^a-zA-Z0-9]', '', domain) or "myapp"
@@ -18,24 +22,19 @@ def create_webview_project(url, app_name, out_dir):
     pkg = sanitize_package(url)
     pkg_path = pkg.replace('.', '/')
     p = Path(out_dir)
-    if p.exists():
-        shutil.rmtree(p)
+    if p.exists(): shutil.rmtree(p)
 
     (p / "app/src/main/java" / pkg_path).mkdir(parents=True)
     (p / "app/src/main/res/values").mkdir(parents=True)
 
-    # MainActivity.java
     (p / "app/src/main/java" / pkg_path / "MainActivity.java").write_text(f'''package {pkg};
-
 import android.os.Bundle;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import androidx.appcompat.app.AppCompatActivity;
-
 public class MainActivity extends AppCompatActivity {{
     private WebView webView;
-
     @Override
     protected void onCreate(Bundle savedInstanceState) {{
         super.onCreate(savedInstanceState);
@@ -43,13 +42,10 @@ public class MainActivity extends AppCompatActivity {{
         WebSettings s = webView.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
-        s.setLoadWithOverviewMode(true);
-        s.setUseWideViewPort(true);
         webView.setWebViewClient(new WebViewClient());
         webView.loadUrl(getString(R.string.app_url));
         setContentView(webView);
     }}
-
     @Override
     public void onBackPressed() {{
         if (webView.canGoBack()) webView.goBack();
@@ -58,21 +54,17 @@ public class MainActivity extends AppCompatActivity {{
 }}
 ''')
 
-    (p / "app/src/main/res/values/strings.xml").write_text(
-        f'<?xml version="1.0" encoding="utf-8"?>\n'
-        f'<resources>\n'
-        f'    <string name="app_name">{app_name}</string>\n'
-        f'    <string name="app_url">{url}</string>\n'
-        f'</resources>\n')
+    (p / "app/src/main/res/values/strings.xml").write_text(f'''<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">{app_name}</string>
+    <string name="app_url">{url}</string>
+</resources>''')
 
     (p / "app/src/main/AndroidManifest.xml").write_text(f'''<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{pkg}">
     <uses-permission android:name="android.permission.INTERNET"/>
-    <application
-        android:allowBackup="true"
-        android:icon="@android:drawable/sym_def_app_icon"
-        android:label="@string/app_name"
-        android:usesCleartextTraffic="true"
+    <application android:allowBackup="true" android:icon="@android:drawable/sym_def_app_icon"
+        android:label="@string/app_name" android:usesCleartextTraffic="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
@@ -81,124 +73,314 @@ public class MainActivity extends AppCompatActivity {{
             </intent-filter>
         </activity>
     </application>
-</manifest>
-''')
+</manifest>''')
 
     (p / "app/build.gradle").write_text(f'''plugins {{ id 'com.android.application' }}
 android {{
     namespace '{pkg}'
     compileSdk 34
-    defaultConfig {{
-        applicationId '{pkg}'
-        minSdk 21
-        targetSdk 34
-        versionCode 1
-        versionName "1.0"
-    }}
-    compileOptions {{
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
-    }}
+    defaultConfig {{ applicationId '{pkg}'; minSdk 21; targetSdk 34; versionCode 1; versionName "1.0" }}
+    compileOptions {{ sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }}
 }}
-dependencies {{
-    implementation 'androidx.appcompat:appcompat:1.6.1'
-}}
-''')
+dependencies {{ implementation 'androidx.appcompat:appcompat:1.6.1' }}''')
 
-    (p / "build.gradle").write_text(
-        "plugins { id 'com.android.application' version '8.2.0' apply false }\n")
-
-    (p / "settings.gradle").write_text('''pluginManagement {
-    repositories { google(); mavenCentral(); gradlePluginPortal() }
-}
-dependencyResolutionManagement {
-    repositories { google(); mavenCentral() }
-}
+    (p / "build.gradle").write_text("plugins { id 'com.android.application' version '8.2.0' apply false }\n")
+    (p / "settings.gradle").write_text('''pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 rootProject.name = "WebViewApp"
 include ':app'
 ''')
+    (p / "gradle.properties").write_text("org.gradle.jvmargs=-Xmx1024m\nandroid.useAndroidX=true\n")
 
-    (p / "gradle.properties").write_text(
-        "org.gradle.jvmargs=-Xmx2048m\nandroid.useAndroidX=true\n")
+def build_apk_thread(task_id, url, app_name):
+    try:
+        project_dir = f"/tmp/webview_{task_id}"
+        create_webview_project(url, app_name, project_dir)
+        
+        env = os.environ.copy()
+        result = subprocess.run(
+            ["gradle", "assembleDebug", "--no-daemon"], 
+            cwd=project_dir, 
+            capture_output=True, 
+            text=True,
+            env=env
+        )
+        
+        if result.returncode != 0:
+            tasks[task_id] = {"status": "error", "message": result.stderr[-1000:]}
+            return
+            
+        apk_path = Path(project_dir) / "app/build/outputs/apk/debug/app-debug.apk"
+        final_apk = f"/tmp/{task_id}.apk"
+        shutil.copy(apk_path, final_apk)
+        
+        tasks[task_id] = {"status": "success", "file": final_apk}
+    except Exception as e:
+        tasks[task_id] = {"status": "error", "message": str(e)}
 
-    return p
-
-def build_apk(project_dir):
-    # Heroku par gradle build chalane ki koshish
-    result = subprocess.run(
-        ["gradle", "assembleDebug"],
-        cwd=project_dir,
-        capture_output=True,
-        text=True
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Build failed:\n{result.stderr}")
-    apk_path = Path(project_dir) / "app/build/outputs/apk/debug/app-debug.apk"
-    if not apk_path.exists():
-        raise RuntimeError("APK file not generated.")
-    return apk_path
-
-# ---------- Flask Routes ----------
-TEMPLATE = """
-<!DOCTYPE html>
-<html>
+# ---------- APPILIX STYLE UI ----------
+HTML_TEMPLATE = """
+<!doctype html>
+<html lang="en">
 <head>
-    <title>URL to APK Converter</title>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Dashboard - App Builder</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap" rel="stylesheet">
     <style>
-        body { font-family: Arial; max-width: 600px; margin: 40px auto; padding: 20px; }
-        input[type=text] { width: 100%; padding: 10px; margin: 10px 0; }
-        input[type=submit] { background: #007bff; color: white; padding: 10px 20px; border: none; cursor: pointer; }
-        .flash { color: red; }
+        body {
+            margin: 0;
+            font-family: 'Inter', sans-serif;
+            background-color: #F4F5F1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .container {
+            background: #ffffff;
+            padding: 40px;
+            border-radius: 16px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.05);
+            width: 100%;
+            max-width: 400px;
+            text-align: center;
+        }
+        .logo-svg {
+            width: 70px;
+            margin-bottom: 20px;
+        }
+        .spinner {
+            width: 70px;
+            animation: _il_spin 1.5s ease-in-out infinite;
+            display: none;
+            margin: 0 auto;
+        }
+        @keyframes _il_spin {
+            from { transform: rotate(0deg); }
+            to   { transform: rotate(360deg); }
+        }
+        h2 { margin-top: 0; color: #1E8A7A; }
+        p { color: #666; font-size: 14px; }
+        input {
+            width: 100%;
+            padding: 12px;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            box-sizing: border-box;
+            font-family: 'Inter', sans-serif;
+            background: #FAFAFA;
+        }
+        button {
+            width: 100%;
+            padding: 14px;
+            background: #1E8A7A;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 10px;
+            transition: background 0.3s;
+        }
+        button:hover { background: #3CB989; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .hidden { display: none; }
+        #error-msg {
+            color: #e74c3c;
+            background: #fadbd8;
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 15px;
+            font-size: 14px;
+            word-break: break-all;
+            display: none;
+        }
+        .download-btn {
+            background: #3CB989;
+            text-decoration: none;
+            display: block;
+            padding: 14px;
+            color: white;
+            border-radius: 8px;
+            font-weight: 600;
+            margin-top: 20px;
+        }
     </style>
 </head>
 <body>
-    <h2>Website URL to Android APK</h2>
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        <ul class="flash">
-        {% for msg in messages %}
-          <li>{{ msg }}</li>
-        {% endfor %}
-        </ul>
-      {% endif %}
-    {% endwith %}
-    <form method="POST" action="/">
-        <label>Website URL:</label>
-        <input type="text" name="url" placeholder="https://example.com" required>
-        <label>App Name (optional):</label>
-        <input type="text" name="app_name" placeholder="My App">
-        <input type="submit" value="Build APK">
+
+<div class="container" id="main-box">
+    <!-- Exact Appilix SVG Logo -->
+    <svg id="app-logo" class="logo-svg" viewBox="0 0 32 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M5.125 4.44067H10.5641L16.0033 13.8681H11.0091L5.125 4.44067Z" fill="#5ED9A6"/>
+        <path d="M10.5645 4.44279L13.2882 -0.267822L18.5038 9.53837L16.0036 13.8661L10.5645 4.44072V4.44279Z" fill="#3CB989"/>
+        <path d="M7.24655 0.764961L5.12305 4.44073H10.5622L13.2859 -0.267814H9.04097C8.30209 -0.269884 7.61702 0.125427 7.24862 0.764961H7.24655Z" fill="#1E8A7A"/>
+        <path d="M16.001 13.866H26.8813L29.603 9.15747L18.5012 9.53829L16.001 13.866Z" fill="#3CB989"/>
+        <path d="M26.882 13.8703L29.5995 18.583L31.723 14.9072C32.0934 14.2677 32.0934 13.4791 31.723 12.8375L29.6015 9.15967L26.8799 13.8703H26.882Z" fill="#1E8A7A"/>
+        <path d="M16.001 13.866L18.4991 18.1937L29.5988 18.5807L26.8813 13.868H16.001V13.866Z" fill="#5ED9A6"/>
+        <path d="M16.0007 13.866L10.5574 23.2851H5.11621L11.0065 13.866H16.0007Z" fill="#3CB989"/>
+        <path d="M10.5576 23.2873L13.2751 28L18.499 18.1959L16.0009 13.8682L10.5576 23.2873Z" fill="#1E8A7A"/>
+        <path d="M5.11621 23.2852L7.23764 26.963C7.60812 27.6025 8.29112 27.9978 9.02999 27.9978H13.277L10.5595 23.2872H5.11828L5.11621 23.2852Z" fill="#5ED9A6"/>
+        <path d="M24.0024 0.00951618L18.5011 9.53837L15.8975 4.63113L18.7247 -0.267822H22.9717C23.3401 -0.265753 23.6919 -0.166408 24.0024 0.00951618Z" fill="url(#paint0_linear_3012_4516)"/>
+        <path d="M26.8821 4.44073L24.0529 9.35417L18.502 9.53838L24.0032 0.00952148C24.3136 0.187515 24.5786 0.446226 24.7628 0.769098L26.8821 4.44073Z" fill="url(#paint1_linear_3012_4516)"/>
+        <path d="M26.878 23.2874L24.709 27.0438C24.5289 27.3274 24.2847 27.5592 24.0011 27.7227L18.7255 18.5767L18.502 18.1938L24.0549 18.3884L26.8801 23.2874H26.878Z" fill="url(#paint2_linear_3012_4516)"/>
+        <path d="M18.4996 18.1937L15.8877 23.0947L18.7128 27.9937H23.1026H23.1068C23.4255 27.9709 23.7277 27.8757 23.9967 27.7205L18.4976 18.1917L18.4996 18.1937Z" fill="url(#paint3_linear_3012_4516)"/>
+        <path d="M8.06765 9.15552H2.3967L0.256642 12.8644C0.0848573 13.1769 0 13.5226 0 13.8682H11.0066L8.06558 9.15552H8.06765Z" fill="url(#paint4_linear_3012_4516)"/>
+        <path d="M0 13.8682C0.00206969 14.2221 0.0952058 14.576 0.277339 14.8947L2.39877 18.5726L8.06558 18.5788L11.0066 13.8682H0Z" fill="url(#paint5_linear_3012_4516)"/>
+        <defs>
+            <linearGradient id="paint0_linear_3012_4516" x1="11.7767" y1="21.1824" x2="20.6991" y2="0.58903" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#1E8A7A"/></linearGradient>
+            <linearGradient id="paint1_linear_3012_4516" x1="8.82201" y1="27.5881" x2="24.2578" y2="4.33517" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#3CB989"/></linearGradient>
+            <linearGradient id="paint2_linear_3012_4516" x1="14.5364" y1="11.8792" x2="26.6607" y2="26.1601" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#1E8A7A"/></linearGradient>
+            <linearGradient id="paint3_linear_3012_4516" x1="5.34469" y1="1.09187" x2="19.8367" y2="25.1334" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#3CB989"/></linearGradient>
+            <linearGradient id="paint4_linear_3012_4516" x1="28.8184" y1="11.4135" x2="3.52882" y2="11.5274" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#1E8A7A"/></linearGradient>
+            <linearGradient id="paint5_linear_3012_4516" x1="34.9219" y1="17.1735" x2="4.02348" y2="16.1303" gradientUnits="userSpaceOnUse"><stop stop-color="#062B25"/><stop offset="1" stop-color="#3CB989"/></linearGradient>
+        </defs>
+    </svg>
+
+    <!-- Appilix Style Spinner -->
+    <svg id="spinner" class="spinner" viewBox="0 0 32 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M5.125 4.44067H10.5641L16.0033 13.8681H11.0091L5.125 4.44067Z" fill="#5ED9A6"/>
+        <path d="M10.5645 4.44279L13.2882 -0.267822L18.5038 9.53837L16.0036 13.8661L10.5645 4.44072V4.44279Z" fill="#3CB989"/>
+        <path d="M7.24655 0.764961L5.12305 4.44073H10.5622L13.2859 -0.267814H9.04097C8.30209 -0.269884 7.61702 0.125427 7.24862 0.764961H7.24655Z" fill="#1E8A7A"/>
+        <path d="M16.001 13.866H26.8813L29.603 9.15747L18.5012 9.53829L16.001 13.866Z" fill="#3CB989"/>
+        <path d="M26.882 13.8703L29.5995 18.583L31.723 14.9072C32.0934 14.2677 32.0934 13.4791 31.723 12.8375L29.6015 9.15967L26.8799 13.8703H26.882Z" fill="#1E8A7A"/>
+        <path d="M16.001 13.866L18.4991 18.1937L29.5988 18.5807L26.8813 13.868H16.001V13.866Z" fill="#5ED9A6"/>
+        <path d="M16.0007 13.866L10.5574 23.2851H5.11621L11.0065 13.866H16.0007Z" fill="#3CB989"/>
+        <path d="M10.5576 23.2873L13.2751 28L18.499 18.1959L16.0009 13.8682L10.5576 23.2873Z" fill="#1E8A7A"/>
+        <path d="M5.11621 23.2852L7.23764 26.963C7.60812 27.6025 8.29112 27.9978 9.02999 27.9978H13.277L10.5595 23.2872H5.11828L5.11621 23.2852Z" fill="#5ED9A6"/>
+    </svg>
+
+    <h2 id="title">Website to APK</h2>
+    <p id="subtitle">Convert any URL into an Android App</p>
+
+    <form id="build-form">
+        <input type="url" id="url" placeholder="https://example.com" required>
+        <input type="text" id="app_name" placeholder="App Name (Optional)">
+        <button type="submit" id="build-btn">Build App</button>
     </form>
+
+    <div id="error-msg"></div>
+    <div id="success-area"></div>
+</div>
+
+<script>
+    const form = document.getElementById('build-form');
+    const spinner = document.getElementById('spinner');
+    const logo = document.getElementById('app-logo');
+    const title = document.getElementById('title');
+    const subtitle = document.getElementById('subtitle');
+    const errorMsg = document.getElementById('error-msg');
+    const successArea = document.getElementById('success-area');
+
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        
+        // UI changes
+        form.style.display = 'none';
+        errorMsg.style.display = 'none';
+        logo.style.display = 'none';
+        spinner.style.display = 'block';
+        title.innerText = "Building APK...";
+        subtitle.innerText = "This may take 2-3 minutes. Please wait.";
+
+        const url = document.getElementById('url').value;
+        const app_name = document.getElementById('app_name').value || "MyApp";
+
+        try {
+            const response = await fetch('/api/build', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({url: url, app_name: app_name})
+            });
+            const data = await response.json();
+            
+            if (data.task_id) {
+                checkStatus(data.task_id);
+            } else {
+                showError(data.error || "Failed to start build.");
+            }
+        } catch (err) {
+            showError("Server connection failed.");
+        }
+    });
+
+    async function checkStatus(taskId) {
+        try {
+            const res = await fetch('/api/status/' + taskId);
+            const data = await res.json();
+
+            if (data.status === 'building') {
+                setTimeout(() => checkStatus(taskId), 5000); // Check every 5 seconds
+            } else if (data.status === 'success') {
+                showSuccess(taskId);
+            } else {
+                showError(data.message || "Build failed. Check server logs.");
+            }
+        } catch (err) {
+            showError("Error checking status.");
+        }
+    }
+
+    function showSuccess(taskId) {
+        spinner.style.display = 'none';
+        title.innerText = "App Ready!";
+        subtitle.innerText = "Your APK has been successfully generated.";
+        successArea.innerHTML = `<a href="/download/${taskId}" class="download-btn">Download APK</a>`;
+    }
+
+    function showError(msg) {
+        spinner.style.display = 'none';
+        logo.style.display = 'block';
+        title.innerText = "Build Failed";
+        subtitle.innerText = "Something went wrong.";
+        form.style.display = 'block';
+        errorMsg.innerText = msg;
+        errorMsg.style.display = 'block';
+    }
+</script>
 </body>
 </html>
 """
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/")
 def index():
-    if request.method == "POST":
-        url = request.form.get("url", "").strip()
-        app_name = request.form.get("app_name", "").strip() or "My WebView App"
+    return render_template_string(HTML_TEMPLATE)
 
-        if not url.startswith(("http://", "https://")):
-            flash("URL must start with http:// or https://")
-            return redirect(url_for("index"))
+@app.route("/api/build", methods=["POST"])
+def api_build():
+    data = request.json
+    url = data.get("url", "").strip()
+    app_name = data.get("app_name", "").strip() or "MyApp"
 
-        try:
-            # Heroku ke /tmp me project banayenge
-            project_dir = "/tmp/webview_project"
-            create_webview_project(url, app_name, project_dir)
-            apk_path = build_apk(project_dir)
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "URL must start with http:// or https://"})
 
-            # APK ko /tmp me copy karke send karenge
-            final_apk = f"/tmp/{app_name.replace(' ', '_')}.apk"
-            shutil.copy(apk_path, final_apk)
+    task_id = str(uuid.uuid4())[:8]
+    tasks[task_id] = {"status": "building"}
+    
+    thread = threading.Thread(target=build_apk_thread, args=(task_id, url, app_name))
+    thread.start()
+    
+    return jsonify({"task_id": task_id})
 
-            return send_file(final_apk, as_attachment=True, download_name=f"{app_name}.apk")
-        except Exception as e:
-            flash(f"Error: {str(e)}")
-            return redirect(url_for("index"))
+@app.route("/api/status/<task_id>")
+def api_status(task_id):
+    task = tasks.get(task_id)
+    if not task:
+        return jsonify({"status": "error", "message": "Task not found"}), 404
+    return jsonify(task)
 
-    return render_template_string(TEMPLATE)
+@app.route("/download/<task_id>")
+def download(task_id):
+    task = tasks.get(task_id)
+    if task and task["status"] == "success":
+        return send_file(task["file"], as_attachment=True, download_name="App.apk")
+    return "File not found", 404
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
