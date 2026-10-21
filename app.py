@@ -4,7 +4,6 @@ import shutil
 import subprocess
 import threading
 import uuid
-import requests
 from pathlib import Path
 from flask import Flask, request, render_template_string, send_file, jsonify
 
@@ -18,7 +17,7 @@ def sanitize_package(url):
     domain = re.sub(r'[^a-zA-Z0-9]', '', domain) or "myapp"
     return f"com.webview.{domain.lower()}"
 
-def create_webview_project(url, app_name, icon_url, out_dir):
+def create_webview_project(url, app_name, logo_path, out_dir):
     pkg = sanitize_package(url)
     pkg_path = pkg.replace('.', '/')
     p = Path(out_dir)
@@ -28,21 +27,19 @@ def create_webview_project(url, app_name, icon_url, out_dir):
     (p / "app/src/main/res/values").mkdir(parents=True)
     (p / "app/src/main/res/drawable").mkdir(parents=True)
 
-    # Logo Download Logic
+    # Logo Handle karein (Uploaded file se)
     icon_reference = "@android:drawable/sym_def_app_icon"
-    if icon_url:
-        try:
-            response = requests.get(icon_url, stream=True)
-            if response.status_code == 200:
-                with open(p / "app/src/main/res/drawable/app_logo.png", 'wb') as f:
-                    for chunk in response.iter_content(1024):
-                        f.write(chunk)
-                icon_reference = "@drawable/app_logo"
-        except Exception as e:
-            print(f"Logo download failed: {e}")
+    if logo_path and os.path.exists(logo_path):
+        # Android ke liye image ko app_logo.png naam se save karein
+        dest_logo = p / "app/src/main/res/drawable/app_logo.png"
+        shutil.copy(logo_path, dest_logo)
+        icon_reference = "@drawable/app_logo"
 
-    # MainActivity.java with PDF & New Tab handling
+    # MainActivity.java with PDF External Open Feature
     (p / "app/src/main/java" / pkg_path / "MainActivity.java").write_text(f'''package {pkg};
+
+import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Message;
 import android.webkit.WebChromeClient;
@@ -65,18 +62,29 @@ public class MainActivity extends AppCompatActivity {{
         s.setLoadWithOverviewMode(true);
         s.setUseWideViewPort(true);
         
+        // Main Window ke liye PDF Handler
         webView.setWebViewClient(new WebViewClient() {{
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {{
                 String url = request.getUrl().toString();
-                if (url.endsWith(".pdf") || url.contains(".pdf?")) {{
-                    view.loadUrl("https://docs.google.com/gview?embedded=true&url=" + url);
+                if (url.toLowerCase().contains(".pdf")) {{
+                    // PDF ko External App (Google Drive/PDF Viewer) me open karein
+                    try {{
+                        Intent intent = new Intent(Intent.ACTION_VIEW);
+                        intent.setDataAndType(Uri.parse(url), "application/pdf");
+                        intent.setFlags(Intent.FLAG_ACTIVITY_NO_HISTORY);
+                        startActivity(intent);
+                    }} catch (Exception e) {{
+                        // Agar PDF viewer nahi hai, toh Google Docs me open karein
+                        view.loadUrl("https://docs.google.com/gview?embedded=true&url=" + url);
+                    }}
                     return true;
                 }}
                 return false;
             }}
         }});
 
+        // New Tab (target="_blank") links ke liye Handler
         webView.setWebChromeClient(new WebChromeClient() {{
             @Override
             public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {{
@@ -84,8 +92,15 @@ public class MainActivity extends AppCompatActivity {{
                 newWebView.setWebViewClient(new WebViewClient() {{
                     @Override
                     public boolean shouldOverrideUrlLoading(WebView view, String url) {{
-                        if (url.endsWith(".pdf") || url.contains(".pdf?")) {{
-                            view.loadUrl("https://docs.google.com/gview?embedded=true&url=" + url);
+                        if (url.toLowerCase().contains(".pdf")) {{
+                            try {{
+                                Intent intent = new Intent(Intent.ACTION_VIEW);
+                                intent.setDataAndType(Uri.parse(url), "application/pdf");
+                                intent.setFlags(Intent.FLAG_ACTIVITY_NO_HISTORY);
+                                startActivity(intent);
+                            }} catch (Exception e) {{
+                                view.loadUrl("https://docs.google.com/gview?embedded=true&url=" + url);
+                            }}
                         }} else {{
                             view.loadUrl(url);
                         }}
@@ -149,10 +164,10 @@ include ':app'
 ''')
     (p / "gradle.properties").write_text("org.gradle.jvmargs=-Xmx2048m\nandroid.useAndroidX=true\n")
 
-def build_apk_thread(task_id, url, app_name, icon_url):
+def build_apk_thread(task_id, url, app_name, logo_path):
     try:
         project_dir = f"/tmp/webview_{task_id}"
-        create_webview_project(url, app_name, icon_url, project_dir)
+        create_webview_project(url, app_name, logo_path, project_dir)
         
         env = os.environ.copy()
         result = subprocess.run(
@@ -191,7 +206,7 @@ HTML_TEMPLATE = """
         @keyframes _il_spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         h2 { margin-top: 0; color: #1E8A7A; }
         p { color: #666; font-size: 14px; }
-        input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; font-family: 'Inter', sans-serif; background: #FAFAFA; }
+        input[type="text"], input[type="url"], input[type="file"] { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; font-family: 'Inter', sans-serif; background: #FAFAFA; }
         button { width: 100%; padding: 14px; background: #1E8A7A; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 10px; transition: background 0.3s; }
         button:hover { background: #3CB989; }
         #error-msg { color: #e74c3c; background: #fadbd8; padding: 10px; border-radius: 8px; margin-top: 15px; font-size: 12px; word-break: break-all; display: none; text-align: left;}
@@ -226,10 +241,14 @@ HTML_TEMPLATE = """
     <h2 id="title">Website to APK</h2>
     <p id="subtitle">Convert any URL into an Android App</p>
 
-    <form id="build-form">
+    <!-- enctype="multipart/form-data" add kiya gaya hai file upload ke liye -->
+    <form id="build-form" enctype="multipart/form-data">
         <input type="url" id="url" placeholder="Website URL (https://...)" required>
         <input type="text" id="app_name" placeholder="App Name (e.g. Testbook)">
-        <input type="url" id="icon_url" placeholder="Logo URL (Optional .png)">
+        
+        <label style="display:block; text-align:left; font-size:12px; color:#666; margin-top:10px; margin-left:5px;">Upload App Logo (Optional):</label>
+        <input type="file" id="icon_file" accept="image/png, image/jpeg, image/jpg">
+        
         <button type="submit" id="build-btn">Build App</button>
     </form>
 
@@ -257,13 +276,20 @@ HTML_TEMPLATE = """
 
         const url = document.getElementById('url').value;
         const app_name = document.getElementById('app_name').value || "MyApp";
-        const icon_url = document.getElementById('icon_url').value || "";
+        const iconFile = document.getElementById('icon_file').files[0];
+
+        // FormData ka use karke file aur text bhejenge
+        const formData = new FormData();
+        formData.append('url', url);
+        formData.append('app_name', app_name);
+        if (iconFile) {
+            formData.append('icon_file', iconFile);
+        }
 
         try {
             const response = await fetch('/api/build', {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({url: url, app_name: app_name, icon_url: icon_url})
+                body: formData // JSON ki jagah FormData bhej rahe hain
             });
             const data = await response.json();
             
@@ -317,10 +343,17 @@ def index():
 
 @app.route("/api/build", methods=["POST"])
 def api_build():
-    data = request.json
-    url = data.get("url", "").strip()
-    app_name = data.get("app_name", "").strip() or "MyApp"
-    icon_url = data.get("icon_url", "").strip()
+    # JSON ki jagah form data read kar rahe hain
+    url = request.form.get("url", "").strip()
+    app_name = request.form.get("app_name", "").strip() or "MyApp"
+    
+    logo_path = None
+    if 'icon_file' in request.files:
+        file = request.files['icon_file']
+        if file.filename != '':
+            # File save karein temporary location par
+            logo_path = f"/tmp/{uuid.uuid4()}.png"
+            file.save(logo_path)
 
     if not url.startswith(("http://", "https://")):
         return jsonify({"error": "URL must start with http:// or https://"})
@@ -328,7 +361,7 @@ def api_build():
     task_id = str(uuid.uuid4())[:8]
     tasks[task_id] = {"status": "building"}
     
-    thread = threading.Thread(target=build_apk_thread, args=(task_id, url, app_name, icon_url))
+    thread = threading.Thread(target=build_apk_thread, args=(task_id, url, app_name, logo_path))
     thread.start()
     
     return jsonify({"task_id": task_id})
